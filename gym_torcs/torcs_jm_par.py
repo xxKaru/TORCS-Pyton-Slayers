@@ -1,3 +1,17 @@
+"""
+Final TORCS driver used by Pyton Slayers.
+
+The driver is based on live telemetry from TORCS. It uses track sensors,
+speed, angle, track position, lateral speed and RPM to control steering,
+braking, throttle and gear shifting.
+
+Main ideas:
+- detect upcoming turn direction from track sensors
+- split corners into driving stages
+- brake based on available distance and estimated safe speed
+- reduce throttle during risky steering/braking situations
+- use recovery logic when the car becomes unstable or leaves the center
+"""
 import socket
 import sys
 import getopt
@@ -443,7 +457,9 @@ def destringify(s):
 # ================= USER CONFIGURABLE PARAMETERS =================
 TARGET_SPEED = 245  # Target speed in km/h. Increasing this makes the car go faster but may reduce stability.
 CENTERING_GAIN = 0.3  # How strongly the car corrects its position toward the center of the track.
-ENABLE_TRACTION_CONTROL = False  # Toggle traction control system.
+# Traction control was tested, but disabled in the final version because
+# it reduced lap performance on our final setup.
+ENABLE_TRACTION_CONTROL = False
 UPSHIFT_RPM = 19500    # Shift up when RPM is above this
 DOWNSHIFT_RPM = 10000  # Shift down when RPM is below this
 max_deceleration = 14 # m/s²
@@ -452,6 +468,10 @@ pending_turn = 'straight'
 turn_confirm_count = 0
 # ================= HELPER FUNCTIONS =================
 def calculate_steering(state, turn, stage):
+    """
+    Calculates steering from track position, car angle, track sensors and
+    current corner stage.
+    """
 
     track = state.get('track', None)
 
@@ -520,6 +540,13 @@ def calculate_steering(state, turn, stage):
     return max(-1.0, min(1.0, steering))
 
 def upcoming_turn(state):
+    """
+    Detects whether the upcoming section is a left turn, right turn or straight.
+
+    The result is confirmed over several simulation steps before changing the
+    active turn. This prevents the driver from reacting too quickly to noisy
+    sensor readings.
+    """
     track = state.get('track', None)
     global active_turn, pending_turn, turn_confirm_count
 
@@ -570,6 +597,12 @@ def turn_opening(state, turn):
     return opening_amount
 
 def turn_stage(state, turn, opening_amount):
+    """
+    Classifies the current part of the corner.
+
+    The stage is used by the steering logic to decide how the car should
+    position itself before, during and after the corner.
+    """
     track = state.get('track', None)
     if turn == 'straight':
         return 'straight'
@@ -588,6 +621,12 @@ def turn_stage(state, turn, opening_amount):
         return 'apex'
 
 def calculate_throttle(state, action):
+    """
+    Controls acceleration.
+
+    The driver accelerates strongly on straights, but reduces throttle when
+    braking is active or when steering demand is high.
+    """
     speed = state.get('speedX', 0.0)
     steering = abs(action.get('steer', 0.0))
 
@@ -620,47 +659,37 @@ def calculate_throttle(state, action):
 
     return max(0.0, min(1.0, acceleration_command))
 
-BRAKE_SENSOR_FACTOR = 0.95
-BRAKE_TRIGGER_MARGIN = 1.12
-SAFE_SPEED_BASE = 45
-SAFE_SPEED_GAIN = 1.05
-OPEN_SIDE_USAGE = 0.75
 def apply_brakes(state, action):
+    """
+    Applies braking when the current speed is too high for the available
+    distance ahead.
+
+    The logic compares estimated braking distance with the front track sensors.
+    """
     speed = state.get('speedX', 0.0)
     track = state.get('track', None)
 
     if not isinstance(track, list) or len(track) < 15:
         return 0.0
 
-    center_distance = max(0.1, track[9])
-
-    left_open_distance = max(track[7], track[8])
-    right_open_distance = max(track[10], track[11])
-    open_side_distance = max(left_open_distance, right_open_distance)
-
-    front_distance = center_distance
-
-    if speed > 80 and open_side_distance > center_distance * 1.20:
-        front_distance = max(front_distance, open_side_distance * OPEN_SIDE_USAGE)
-
-    front_distance = front_distance * BRAKE_SENSOR_FACTOR
+    front_distance = max(0.1,min(track[8], track[9], track[10], track[7], track[11]))
+    front_distance = front_distance*0.9
 
     speed_meters_per_second = speed / 3.6
-
-    safe_speed = SAFE_SPEED_BASE + SAFE_SPEED_GAIN * front_distance
+    safe_speed = 35 + 0.9*front_distance
     safe_speed_meters_per_second = safe_speed / 3.6
 
-    required_braking_distance = max(
-        0.0,
-        (speed_meters_per_second**2 - safe_speed_meters_per_second**2)
-        / (2 * max_deceleration)
-    )
+    required_braking_distance = max(0.0,(speed_meters_per_second**2 - safe_speed_meters_per_second**2) / (2 * max_deceleration))
 
-    braking_trigger_distance = front_distance * BRAKE_TRIGGER_MARGIN
+    if speed > 120:
+        if (track[7] - track[9]) > (front_distance * 0.05) or (track[11] - track[9]) >(front_distance * 0.05):
+            return 0.0
+        if (track[8] - track[9]) > (front_distance * 0.07) or (track[10] - track[9]) > (front_distance * 0.07):
+            return 0.0
 
-    if required_braking_distance > braking_trigger_distance:
-        brake_intensity = (required_braking_distance - braking_trigger_distance) / front_distance
-        return min(1.0, 0.10 + 0.65 * brake_intensity)
+    if required_braking_distance > front_distance:
+        brake_intensity = (required_braking_distance - front_distance) / front_distance
+        return min(1, 0.15+ 0.85 * brake_intensity)
 
     return 0.0
 
@@ -692,6 +721,9 @@ def traction_control(state, acceleration_command):
     return max(0.0, min(1.0, acceleration_command))
 
 def anti_spin_recover(state, action):
+    """
+    Recovery logic for unstable lateral movement.
+    """
     lateral_speed = state.get('speedY',0.0)
     if abs(lateral_speed) < 16.0:
         return False
@@ -703,6 +735,9 @@ def anti_spin_recover(state, action):
 
 border_active = False
 def border_recovery(state, action):
+    """
+    Recovery logic used when the car moves too far from the center of the track.
+    """
     global border_active
     track_position = state.get('trackPos', 0.0)
     angle = state.get('angle', 0.0)
@@ -720,6 +755,13 @@ def border_recovery(state, action):
     return True
 
 def drive_modular(client):
+    """
+    Main control pipeline for one simulation step.
+
+    This function reads the current TORCS state, detects the turn and corner
+    stage, calculates steering, applies recovery logic when needed, then sets
+    braking, throttle and gear commands.
+    """
     state, action = client.S.d, client.R.d
 
     turn = upcoming_turn(state)
